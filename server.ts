@@ -82,21 +82,28 @@ function makeLoopWatchdog() {
   };
 }
 
+async function chatHistory(chatId: number): Promise<ChatMessage[]> {
+  return (await sql`SELECT role, content FROM messages WHERE chat_id = ${chatId} ORDER BY id`).map(
+    (m: any) => ({ role: m.role, content: m.content })
+  );
+}
+
 async function streamChat(chatId: number, userContent: string): Promise<Response> {
   const [chat] = await sql`SELECT * FROM chats WHERE id = ${chatId}`;
   if (!chat) return json({ error: "chat not found" }, 404);
 
-  const history: ChatMessage[] = (
-    await sql`SELECT role, content FROM messages WHERE chat_id = ${chatId} ORDER BY id`
-  ).map((m: any) => ({ role: m.role, content: m.content }));
-
+  const history = await chatHistory(chatId);
   await sql`INSERT INTO messages (chat_id, role, content) VALUES (${chatId}, 'user', ${userContent})`;
   if (history.length === 0) {
     const title = userContent.slice(0, 60);
     await sql`UPDATE chats SET title = ${title} WHERE id = ${chatId}`;
   }
   history.push({ role: "user", content: userContent });
+  return generateReply(chat, history);
+}
 
+async function generateReply(chat: any, history: ChatMessage[]): Promise<Response> {
+  const chatId: number = chat.id;
   console.log(`chat ${chatId}: generating with ${chat.model} (mode=${chat.mode}, think=${chat.think})`);
   const options = { num_ctx: Number(process.env.NUM_CTX ?? 8192) };
   let upstream: Response;
@@ -345,6 +352,29 @@ Bun.serve({
         const { content } = await req.json();
         if (!content?.trim()) return json({ error: "content required" });
         return streamChat(Number(req.params.id), content.trim());
+      },
+    },
+    // Rewind the chat to a message and regenerate from there. Resending from
+    // a user message discards everything after it; regenerating an assistant
+    // message discards it and everything after.
+    "/api/chats/:id/messages/:mid/regenerate": {
+      POST: async (req) => {
+        const id = Number(req.params.id);
+        const mid = Number(req.params.mid);
+        const [chat] = await sql`SELECT * FROM chats WHERE id = ${id}`;
+        if (!chat) return json({ error: "chat not found" }, 404);
+        const [msg] = await sql`SELECT role FROM messages WHERE id = ${mid} AND chat_id = ${id}`;
+        if (!msg) return json({ error: "message not found" }, 404);
+        if (msg.role === "user") {
+          await sql`DELETE FROM messages WHERE chat_id = ${id} AND id > ${mid}`;
+        } else {
+          await sql`DELETE FROM messages WHERE chat_id = ${id} AND id >= ${mid}`;
+        }
+        const history = await chatHistory(id);
+        if (history[history.length - 1]?.role !== "user") {
+          return json({ error: "nothing to regenerate from" });
+        }
+        return generateReply(chat, history);
       },
     },
   },
