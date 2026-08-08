@@ -52,6 +52,36 @@ function makeThinkParser(emit: (t: "think" | "text", d: string) => void) {
   };
 }
 
+// Repetition watchdog: fires when the tail of the output (PROBE chars) has
+// appeared REPEATS+ times within the recent WINDOW. Catches sentence-level
+// loops directly; short-period loops ("ha ha ha…") are caught because a long
+// enough run makes any tail-sized slice repeat throughout the window.
+function makeLoopWatchdog() {
+  if (process.env.WATCHDOG === "off") return { push: (_: string) => false };
+  const PROBE = Number(process.env.WATCHDOG_PROBE ?? 90);
+  const REPEATS = Number(process.env.WATCHDOG_REPEATS ?? 4);
+  const WINDOW = Number(process.env.WATCHDOG_WINDOW ?? 6000);
+  const CHECK_EVERY = 200;
+  let buf = "";
+  let since = 0;
+  return {
+    push(d: string): boolean {
+      buf = (buf + d).slice(-WINDOW);
+      since += d.length;
+      if (since < CHECK_EVERY || buf.length < PROBE * REPEATS) return false;
+      since = 0;
+      const probe = buf.slice(-PROBE);
+      let count = 0;
+      let i = 0;
+      while ((i = buf.indexOf(probe, i)) !== -1) {
+        count++;
+        i += PROBE;
+      }
+      return count >= REPEATS;
+    },
+  };
+}
+
 async function streamChat(chatId: number, userContent: string): Promise<Response> {
   const [chat] = await sql`SELECT * FROM chats WHERE id = ${chatId}`;
   if (!chat) return json({ error: "chat not found" }, 404);
@@ -149,9 +179,12 @@ async function streamChat(chatId: number, userContent: string): Promise<Response
           controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
         } catch {} // stream already closed (client stopped) — drop silently
       };
+      const watchdog = makeLoopWatchdog();
+      let looped = false;
       const parser = makeThinkParser((t, d) => {
         if (t === "think") thinking += d;
         else content += d;
+        if (watchdog.push(d)) looped = true;
         send({ t, d });
       });
       const reader = upstream.body!.getReader();
@@ -170,6 +203,7 @@ async function streamChat(chatId: number, userContent: string): Promise<Response
             if (evt.response) parser.push(evt.response); // generate (raw) shape
             if (evt.message?.thinking) {
               thinking += evt.message.thinking; // chat shape: pre-separated
+              if (watchdog.push(evt.message.thinking)) looped = true;
               send({ t: "think", d: evt.message.thinking });
             }
             if (evt.message?.content) parser.push(evt.message.content);
@@ -178,11 +212,17 @@ async function streamChat(chatId: number, userContent: string): Promise<Response
               send({ t: "error", d: evt.error });
             }
           }
+          if (looped) {
+            console.log(`chat ${chatId}: watchdog abort after ${thinking.length}+${content.length} chars`);
+            await reader.cancel().catch(() => {});
+            break;
+          }
         }
         parser.end();
         const promoted = !content.trim() && thinking.trim();
         await saveAssistant();
         if (promoted) send({ t: "promote" });
+        if (looped) send({ t: "error", d: "generation stopped: repeating output detected" });
         send({ t: "done" });
       } catch (e: any) {
         // Upstream died mid-stream (cloud disconnect etc.) — keep the partial
