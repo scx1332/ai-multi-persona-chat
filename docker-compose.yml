@@ -2,7 +2,8 @@ services:
   app:
     build: .
     ports:
-      - "3000:3000"
+      # Bound to localhost only — nginx terminates TLS and proxies here
+      - "127.0.0.1:41297:3000"
     environment:
       DATABASE_URL: postgres://ollamachat:ollamachat@postgres:5432/ollamachat
       OLLAMA_URL: http://ollama:11434
