@@ -67,6 +67,7 @@ async function streamChat(chatId: number, userContent: string): Promise<Response
   }
   history.push({ role: "user", content: userContent });
 
+  console.log(`chat ${chatId}: generating with ${chat.model} (mode=${chat.mode}, think=${chat.think})`);
   const options = { num_ctx: Number(process.env.NUM_CTX ?? 8192) };
   let upstream: Response;
   if (chat.mode === "raw") {
@@ -124,11 +125,30 @@ async function streamChat(chatId: number, userContent: string): Promise<Response
 
   let thinking = "";
   let content = "";
+  let saved = false;
   const encoder = new TextEncoder();
+
+  const saveAssistant = async () => {
+    if (saved || (!content.trim() && !thinking.trim())) return;
+    saved = true;
+    // Weak models sometimes answer inside <think> and stop without closing
+    // the tag — promote the reasoning to the answer so it isn't lost.
+    if (!content.trim()) {
+      content = thinking;
+      thinking = "";
+    }
+    await sql`
+      INSERT INTO messages (chat_id, role, content, thinking)
+      VALUES (${chatId}, 'assistant', ${content.trim()}, ${thinking.trim() || null})`;
+  };
 
   const stream = new ReadableStream({
     async start(controller) {
-      const send = (obj: unknown) => controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
+      const send = (obj: unknown) => {
+        try {
+          controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
+        } catch {} // stream already closed (client stopped) — drop silently
+      };
       const parser = makeThinkParser((t, d) => {
         if (t === "think") thinking += d;
         else content += d;
@@ -153,29 +173,33 @@ async function streamChat(chatId: number, userContent: string): Promise<Response
               send({ t: "think", d: evt.message.thinking });
             }
             if (evt.message?.content) parser.push(evt.message.content);
-            if (evt.error) send({ t: "error", d: evt.error });
+            if (evt.error) {
+              console.error(`chat ${chatId}: upstream error event:`, evt.error);
+              send({ t: "error", d: evt.error });
+            }
           }
         }
         parser.end();
-        // Weak models sometimes answer inside <think> and stop without closing
-        // the tag — promote the reasoning to the answer so it isn't lost.
-        if (!content.trim() && thinking.trim()) {
-          content = thinking;
-          thinking = "";
-          send({ t: "promote" });
-        }
-        await sql`
-          INSERT INTO messages (chat_id, role, content, thinking)
-          VALUES (${chatId}, 'assistant', ${content.trim()}, ${thinking.trim() || null})`;
+        const promoted = !content.trim() && thinking.trim();
+        await saveAssistant();
+        if (promoted) send({ t: "promote" });
         send({ t: "done" });
       } catch (e: any) {
-        send({ t: "error", d: String(e?.message ?? e) });
+        // Upstream died mid-stream (cloud disconnect etc.) — keep the partial
+        // reply instead of dropping it.
+        console.error(`chat ${chatId}: stream error after ${thinking.length}+${content.length} chars:`, e);
+        parser.end();
+        await saveAssistant().catch((err) => console.error(`chat ${chatId}: save failed:`, err));
+        send({ t: "error", d: `generation interrupted: ${String(e?.message ?? e)}` });
       } finally {
         controller.close();
       }
     },
-    cancel() {
+    async cancel() {
+      // Client hit Stop (or navigated away) — abort upstream, keep partial.
       upstream.body?.cancel().catch(() => {});
+      console.log(`chat ${chatId}: client cancelled after ${thinking.length}+${content.length} chars`);
+      await saveAssistant().catch((err) => console.error(`chat ${chatId}: save failed:`, err));
     },
   });
 

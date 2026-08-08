@@ -215,11 +215,15 @@ async function openChat(id) {
   $("input").focus();
 }
 
+let aborter = null;
+
 async function send() {
+  if (streaming) { aborter?.abort(); return; } // Stop button
   const text = $("input").value.trim();
-  if (!text || streaming || !currentChat) return;
+  if (!text || !currentChat) return;
   $("input").value = "";
-  streaming = true; $("send").disabled = true;
+  streaming = true; $("send").textContent = "Stop";
+  aborter = new AbortController();
   renderMessage("user", text);
 
   const div = document.createElement("div");
@@ -235,6 +239,7 @@ async function send() {
     const r = await fetch(`/api/chats/${currentChat.id}/messages`, {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ content: text }),
+      signal: aborter.signal,
     });
     const reader = r.body.getReader();
     const decoder = new TextDecoder();
@@ -257,15 +262,18 @@ async function send() {
           bubbleEl.textContent = thinkEl.textContent;
           sawThink = false; sawText = true;
         }
-        if (evt.t === "error") bubbleEl.innerHTML += `<span class="error">${esc(evt.d)}</span>`;
+        if (evt.t === "error") { sawText = true; bubbleEl.innerHTML += `<span class="error">${esc(evt.d)}</span>`; }
+        if (evt.error) { sawText = true; bubbleEl.innerHTML += `<span class="error">${esc(evt.error)}</span>`; }
       }
       $("messages").scrollTop = $("messages").scrollHeight;
     }
   } catch (e) {
-    bubbleEl.innerHTML += `<span class="error">${esc(e.message)}</span>`;
+    if (e.name === "AbortError") bubbleEl.innerHTML += `<span class="error"> [stopped]</span>`;
+    else bubbleEl.innerHTML += `<span class="error">${esc(e.message)}</span>`;
   }
   if (!sawThink) details.remove();
-  streaming = false; $("send").disabled = false;
+  if (!bubbleEl.textContent) bubbleEl.innerHTML = `<span class="error">(no response — check the model and try again)</span>`;
+  streaming = false; $("send").textContent = "Send"; aborter = null;
   loadChats();
   $("input").focus();
 }
